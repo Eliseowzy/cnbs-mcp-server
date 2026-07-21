@@ -1,0 +1,49 @@
+name: GitHub Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.[0-9]+.[0-9]+'
+      - '[0-9]+.[0-9]+.[0-9]+-*'
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Prepare release notes
+        run: |
+          cat > release-notes.md <<'EOF'
+          ## Docker image
+
+          This project is distributed as a Docker image:
+
+          ```bash
+          docker pull ghcr.io/eliseowzy/cnbs-mcp-server:${{ github.ref_name }}
+          ```
+
+          Run it locally:
+
+          ```bash
+          docker run --rm \
+            -p 12345:12345 \
+            -e CNBS_MCP_SERVER_AUTH_TOKEN=your-token \
+            ghcr.io/eliseowzy/cnbs-mcp-server:${{ github.ref_name }}
+          ```
+
+          MCP endpoint:
+
+          ```text
+          http://127.0.0.1:12345/mcp
+          ```
+          EOF
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          append_body: true
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

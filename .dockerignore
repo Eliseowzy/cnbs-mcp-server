@@ -1,0 +1,16 @@
+node_modules
+dist
+.git
+.github
+*.log
+.DS_Store
+.env
+cache
+logs
+.idea
+.claude
+.trae
+coverage
+src/__tests__
+*.md
+pnpm-lock.yaml

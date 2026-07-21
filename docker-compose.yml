@@ -1,0 +1,17 @@
+services:
+  cnbs-mcp-server:
+    build: .
+    ports:
+      - "12345:12345"
+    restart: unless-stopped
+    environment:
+      CNBS_MCP_SERVER_AUTH_TOKEN: "${CNBS_MCP_SERVER_AUTH_TOKEN:-}"
+      LOG_LEVEL: "${LOG_LEVEL:-info}"
+      LOG_DIR: /app/logs
+    volumes:
+      - ./logs:/app/logs
+    healthcheck:
+      test: ["CMD", "node", "-e", "const s=require('net').connect(12345,'127.0.0.1',()=>{s.end();process.exit(0)});s.on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
