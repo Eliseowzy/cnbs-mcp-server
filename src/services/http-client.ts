@@ -17,11 +17,24 @@ const httpsAgent = new https.Agent({
   keepAlive: true,
 });
 
+// Default to a modern Chrome UA so upstream WAF/anti-bot logic does not flag the
+// default `axios/x.y.z` signature. Overridable via CNBS_USER_AGENT to mirror the
+// existing CNBS_INSECURE_TLS style of environment-driven overrides.
+const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ' +
+  '(KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36';
+
 export const sharedAxiosConfig: AxiosRequestConfig = {
   httpsAgent,
   timeout: 30000,
   maxRedirects: 5,
   proxy: false as const,
+  headers: {
+    'User-Agent': process.env.CNBS_USER_AGENT || DEFAULT_USER_AGENT,
+    Accept: 'application/json, text/plain, */*',
+    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
+    Referer: 'https://data.stats.gov.cn/',
+  },
 };
 
 /**

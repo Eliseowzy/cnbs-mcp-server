@@ -78,7 +78,9 @@ function validateCnbsApiResponse(
       message: blockedByWaf
         ? 'CNBS upstream returned an anti-bot or browser challenge page instead of JSON data.'
         : 'CNBS upstream returned HTML instead of the expected JSON payload.',
-      canRetry: false,
+      // WAF challenges are intermittent and often self-heal on retry with a
+      // longer backoff; non-WAF HTML (format change / redirect) is not retried.
+      canRetry: blockedByWaf,
       endpoint,
       status: response.status,
       contentType,
@@ -91,6 +93,120 @@ function validateCnbsApiResponse(
         : ['The upstream response format changed or the request was redirected to a non-API page.'],
     });
   }
+}
+
+type ParsedPeriod =
+  | { kind: 'annual'; year: number }
+  | { kind: 'quarter'; year: number; startMonth: number }
+  | { kind: 'month'; year: number; month: number };
+
+const PERIOD_ANNUAL_RE = /^(\d{4})YY$/;
+const PERIOD_QUARTER_RE = /^(\d{4})([A-D])$/;
+const PERIOD_MONTH_RE = /^(\d{4})(\d{2})MM$/;
+const QUARTER_START_MONTH: Record<string, number> = { A: 1, B: 4, C: 7, D: 10 };
+const PERIOD_FORMAT_HINT =
+  '支持年度 2024YY、季度 2024A/B/C/D、月度 202401MM，或区间 起-止（如 202001MM-202412MM）。';
+
+/** Parse a single (non-range) period token, or null when the format is illegal. */
+function parseSinglePeriod(token: string): ParsedPeriod | null {
+  let m = PERIOD_ANNUAL_RE.exec(token);
+  if (m) return { kind: 'annual', year: Number(m[1]) };
+
+  m = PERIOD_QUARTER_RE.exec(token);
+  if (m) return { kind: 'quarter', year: Number(m[1]), startMonth: QUARTER_START_MONTH[m[2]] };
+
+  m = PERIOD_MONTH_RE.exec(token);
+  if (m) {
+    const month = Number(m[2]);
+    if (month < 1 || month > 12) return null;
+    return { kind: 'month', year: Number(m[1]), month };
+  }
+
+  return null;
+}
+
+/**
+ * Decide whether a parsed period lies in the future relative to `now`.
+ * Annual: filtered only when the year is beyond the current year.
+ * Quarter: judged by the quarter's starting month; the just-started quarter is
+ *   treated as future (2026-07 → 2026A/2026B valid, 2026C/2026D filtered).
+ * Month: filtered only when strictly later than the current year-month.
+ */
+function isFuturePeriod(period: ParsedPeriod, now: Date): boolean {
+  const curYear = now.getFullYear();
+  const curMonth = now.getMonth() + 1;
+
+  if (period.kind === 'annual') {
+    return period.year > curYear;
+  }
+  if (period.year !== curYear) {
+    return period.year > curYear;
+  }
+  if (period.kind === 'quarter') {
+    return period.startMonth >= curMonth;
+  }
+  return period.month > curMonth;
+}
+
+function throwPeriodValidationError(message: string): never {
+  throw CnbsErrorHandler.createServiceError({
+    type: CnbsErrorType.VALIDATION_ERROR,
+    message,
+    canRetry: false,
+  });
+}
+
+/**
+ * Validate and normalize `dts` before hitting the upstream esData endpoint.
+ * Rejects illegal formats up front (no upstream request), passes range tokens
+ * through untouched, and drops future periods so invalid metric+period combos
+ * do not trigger opaque upstream 500s. Throws VALIDATION_ERROR when the input
+ * is empty or every entry is filtered as future.
+ */
+export function normalizePeriods(periods: string[], now: Date = new Date()): string[] {
+  if (!Array.isArray(periods) || periods.length === 0) {
+    throwPeriodValidationError(`periods 不能为空，请提供至少一个时间段。${PERIOD_FORMAT_HINT}`);
+  }
+
+  const kept: string[] = [];
+  const filteredFuture: string[] = [];
+
+  for (const raw of periods) {
+    const token = typeof raw === 'string' ? raw.trim() : '';
+    if (!token) {
+      throwPeriodValidationError(`非法的时间段格式：「${String(raw)}」。${PERIOD_FORMAT_HINT}`);
+    }
+
+    // Range form X-Y (e.g. findAndFetch's 202001MM-202607MM): validate both
+    // endpoints then pass the original token through without future filtering.
+    if (token.includes('-')) {
+      const parts = token.split('-');
+      const valid = parts.length === 2 && parts.every((part) => parseSinglePeriod(part) !== null);
+      if (!valid) {
+        throwPeriodValidationError(`非法的时间段区间：「${token}」。${PERIOD_FORMAT_HINT}`);
+      }
+      kept.push(token);
+      continue;
+    }
+
+    const parsed = parseSinglePeriod(token);
+    if (!parsed) {
+      throwPeriodValidationError(`非法的时间段格式：「${token}」。${PERIOD_FORMAT_HINT}`);
+    }
+    if (isFuturePeriod(parsed, now)) {
+      filteredFuture.push(token);
+      continue;
+    }
+    kept.push(token);
+  }
+
+  if (kept.length === 0) {
+    throwPeriodValidationError(
+      `所有时间段都晚于当前日期（${filteredFuture.join(', ')}），已被过滤；请改用不晚于当前时间的时段。`,
+    );
+  }
+
+  return kept;
 }
 
 /**
@@ -438,8 +554,10 @@ export class CnbsModernClient {
   }
 
   async fetchSeries(params: CnbsSeriesQuery): Promise<CnbsSeriesResponse> {
+    // Validate + drop future periods before touching cache or upstream.
+    const periods = normalizePeriods(params.periods);
     const cacheKey = CacheKeyGenerator.generateSeriesKey(
-      params.setId, params.metricIds, params.periods, params.areas,
+      params.setId, params.metricIds, periods, params.areas,
     );
     return this.seriesCache.fetchOrLoad(
       cacheKey,
@@ -451,7 +569,7 @@ export class CnbsModernClient {
             das: (params.areas || [{ text: '全国', code: '000000000000' }])
               .map(area => ({ text: area.text, value: area.code })),
             daCatalogId: '',
-            dts: params.periods,
+            dts: periods,
             showType: params.displayMode || '1',
             rootId: params.rootId || this.rootId,
           };
@@ -459,7 +577,7 @@ export class CnbsModernClient {
           const response = await loggedPost(
             'series',
             `${this.baseUrl}/stream/esData`, payload,
-            { ...sharedAxiosConfig, timeout: this.timeout, headers: { 'Content-Type': 'application/json' } },
+            { ...sharedAxiosConfig, timeout: this.timeout, headers: { ...sharedAxiosConfig.headers, 'Content-Type': 'application/json' } },
           );
           validateCnbsApiResponse(`${this.baseUrl}/stream/esData`, response);
           return response.data as CnbsSeriesResponse;

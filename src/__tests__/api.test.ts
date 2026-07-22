@@ -1,5 +1,5 @@
 // 模拟 axios 模块
-import { CnbsModernClient } from '../services/api.js';
+import { CnbsModernClient, normalizePeriods } from '../services/api.js';
 
 jest.mock('axios', () => ({
   get: jest.fn(),
@@ -160,7 +160,7 @@ describe('CnbsModernClient', () => {
       const result = await client.fetchSeries({
         setId: '1',
         metricIds: ['1'],
-        periods: ['2024'],
+        periods: ['2024YY'],
         areas: [{ text: '全国', code: '000000000000' }]
       });
 
@@ -181,9 +181,67 @@ describe('CnbsModernClient', () => {
       await expect(client.fetchSeries({
         setId: '1',
         metricIds: ['1'],
-        periods: ['2024'],
+        periods: ['2024YY'],
         areas: [{ text: '全国', code: '000000000000' }]
       })).rejects.toThrow('API error');
+    });
+
+    it('rejects illegal periods without hitting the upstream', async () => {
+      await expect(client.fetchSeries({
+        setId: '1',
+        metricIds: ['1'],
+        periods: ['not-a-period'],
+        areas: [{ text: '全国', code: '000000000000' }],
+      })).rejects.toThrow(/非法的时间段/);
+      expect(mockAxiosPost).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('normalizePeriods', () => {
+    const now = new Date('2026-07-23T00:00:00');
+
+    it('passes valid annual/quarter/month tokens through', () => {
+      expect(normalizePeriods(['2020YY', '2020A', '202001MM'], now)).toEqual([
+        '2020YY',
+        '2020A',
+        '202001MM',
+      ]);
+    });
+
+    it('filters future annual periods but keeps the current year', () => {
+      expect(normalizePeriods(['2025YY', '2026YY', '2027YY'], now)).toEqual([
+        '2025YY',
+        '2026YY',
+      ]);
+    });
+
+    it('keeps started quarters and drops the current/future ones', () => {
+      // At 2026-07: 2026A (start 1) and 2026B (start 4) valid; 2026C (start 7) and 2026D filtered.
+      expect(normalizePeriods(['2026A', '2026B', '2026C', '2026D'], now)).toEqual([
+        '2026A',
+        '2026B',
+      ]);
+    });
+
+    it('passes range tokens through untouched', () => {
+      expect(normalizePeriods(['202001MM-202607MM'], now)).toEqual(['202001MM-202607MM']);
+    });
+
+    it('throws on illegal single formats', () => {
+      expect(() => normalizePeriods(['2024'], now)).toThrow(/非法的时间段/);
+      expect(() => normalizePeriods(['2024ZZ'], now)).toThrow(/非法的时间段/);
+    });
+
+    it('throws on illegal range endpoints', () => {
+      expect(() => normalizePeriods(['202001MM-foo'], now)).toThrow(/非法的时间段区间/);
+    });
+
+    it('throws when input is empty', () => {
+      expect(() => normalizePeriods([], now)).toThrow(/不能为空/);
+    });
+
+    it('throws when every period is filtered as future', () => {
+      expect(() => normalizePeriods(['2027YY', '2028YY'], now)).toThrow(/晚于当前日期/);
     });
   });
 

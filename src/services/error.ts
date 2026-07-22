@@ -4,6 +4,39 @@ import { upstreamErrorsTotal, upstreamRetriesTotal } from './metrics.js';
 
 const log = createLogger('error');
 
+/** Normalize/stringify a value for logging or hints, collapsing whitespace and truncating. */
+function truncateForLog(value: unknown, maxLength = 300): string | undefined {
+  if (value === undefined || value === null) return undefined;
+  let text: string;
+  if (typeof value === 'string') {
+    text = value;
+  } else {
+    try {
+      text = JSON.stringify(value);
+    } catch {
+      text = String(value);
+    }
+  }
+  const normalized = text.replace(/\s+/g, ' ').trim();
+  if (!normalized) return undefined;
+  return normalized.length > maxLength ? `${normalized.slice(0, maxLength)}…` : normalized;
+}
+
+/**
+ * Reduce a (possibly axios) error to a compact log-friendly object so we never
+ * serialize the full axios error (config/request/socket) into the logs.
+ */
+function compactAxiosError(error: unknown): Record<string, unknown> | undefined {
+  if (!axios.isAxiosError(error)) return undefined;
+  return {
+    method: error.config?.method,
+    url: error.config?.url,
+    status: error.response?.status,
+    code: error.code,
+    body: truncateForLog(error.response?.data),
+  };
+}
+
 // Re-export from split modules for backward compatibility during migration
 export { CnbsRequestThrottler, cnbsRequestThrottler } from './throttler.js';
 export { safePropertyAccess, validateParams } from './boundary.js';
@@ -66,8 +99,8 @@ class DefaultErrorMonitor implements ErrorMonitor {
     this.errorStats[errorType] = (this.errorStats[errorType] || 0) + 1;
     upstreamErrorsTotal.inc({ type: errorType });
     
-    // 记录详细错误信息
-    log.error({ err: error.source || error, type: errorType }, error.message);
+    // 记录详细错误信息（axios error 压缩为紧凑对象，避免日志噪音）
+    log.error({ err: compactAxiosError(error.source) ?? error.source ?? error, type: errorType }, error.message);
   }
 
   getErrorStats(): Record<string, number> {
@@ -119,7 +152,7 @@ export class CnbsErrorHandler {
           type: CnbsErrorType.ACCESS_BLOCKED,
           message: 'Remote CNBS service entered a redirect loop, likely due to anti-bot or access control.',
           source: error,
-          canRetry: false,
+          canRetry: true,
           code: error.code,
           hints: [
             'The upstream site may be serving a WAF or anti-bot challenge instead of JSON data.',
@@ -155,6 +188,12 @@ export class CnbsErrorHandler {
             canRetry: true,
             code: error.code,
             status,
+            endpoint: error.config?.url,
+            rawSnippet: truncateForLog(error.response.data),
+            hints: [
+              '检查 periods 粒度是否与该数据集 dt 类型（年/季/月）匹配。',
+              '上游对无效的指标+时段组合可能返回 500，请核对 metricIds 与 setId 是否对应。',
+            ],
           };
           errorMonitor.trackError(details);
           return details;
@@ -262,7 +301,12 @@ export class CnbsErrorHandler {
       CnbsErrorType.RATE_LIMIT,
       CnbsErrorType.API_FAILURE,
       CnbsErrorType.CACHE_ERROR,
+      CnbsErrorType.ACCESS_BLOCKED,
     ];
+
+    // WAF challenges self-heal only after a pause; retrying too quickly just
+    // re-triggers the block, so ACCESS_BLOCKED gets a higher backoff floor.
+    const ACCESS_BLOCKED_MIN_DELAY = 3000;
 
     let lastError: unknown;
 
@@ -273,7 +317,7 @@ export class CnbsErrorHandler {
         const errorDetails = this.analyze(error);
         lastError = error;
 
-        log.warn({ attempt: attempt + 1, maxAttempts, code: axios.isAxiosError(error) ? error.code : undefined, err: error }, 'Request attempt failed');
+        log.warn({ attempt: attempt + 1, maxAttempts, err: compactAxiosError(error) ?? error }, 'Request attempt failed');
         upstreamRetriesTotal.inc({ endpoint: 'unknown' });
 
         // 检查是否可以重试
@@ -288,8 +332,18 @@ export class CnbsErrorHandler {
           maxDelay
         );
 
+        // WAF blocks need a longer cool-down before the challenge lifts.
+        if (errorDetails.type === CnbsErrorType.ACCESS_BLOCKED) {
+          delay = Math.max(delay, ACCESS_BLOCKED_MIN_DELAY);
+        }
+
         // 添加随机抖动，避免重试风暴
         delay = delay * (0.8 + Math.random() * 0.4);
+
+        // Keep the ACCESS_BLOCKED floor intact even after downward jitter.
+        if (errorDetails.type === CnbsErrorType.ACCESS_BLOCKED) {
+          delay = Math.max(delay, ACCESS_BLOCKED_MIN_DELAY);
+        }
 
         log.debug({ delayMs: Math.round(delay) }, 'Retrying request');
         await this.wait(Math.round(delay));

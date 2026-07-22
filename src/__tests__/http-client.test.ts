@@ -32,6 +32,34 @@ describe('http-client', () => {
     it('should have an httpsAgent configured', () => {
       expect(sharedAxiosConfig.httpsAgent).toBeDefined();
     });
+
+    it('sends browser-like headers instead of the axios UA', () => {
+      const headers = sharedAxiosConfig.headers as Record<string, string>;
+      expect(headers).toBeDefined();
+      expect(String(headers['User-Agent'])).not.toContain('axios');
+      expect(headers['Accept']).toContain('application/json');
+      expect(headers['Accept-Language']).toContain('zh-CN');
+      expect(headers['Referer']).toBe('https://data.stats.gov.cn/');
+    });
+
+    it('uses a default Chrome UA when CNBS_USER_AGENT is unset', async () => {
+      const prev = process.env.CNBS_USER_AGENT;
+      delete process.env.CNBS_USER_AGENT;
+      jest.resetModules();
+      const mod = await import('../services/http-client');
+      expect(String((mod.sharedAxiosConfig.headers as Record<string, string>)['User-Agent'])).toMatch(/Mozilla\/5\.0/);
+      if (prev !== undefined) process.env.CNBS_USER_AGENT = prev;
+    });
+
+    it('honors the CNBS_USER_AGENT override', async () => {
+      const prev = process.env.CNBS_USER_AGENT;
+      process.env.CNBS_USER_AGENT = 'custom-agent/1.0';
+      jest.resetModules();
+      const mod = await import('../services/http-client');
+      expect((mod.sharedAxiosConfig.headers as Record<string, string>)['User-Agent']).toBe('custom-agent/1.0');
+      if (prev === undefined) delete process.env.CNBS_USER_AGENT;
+      else process.env.CNBS_USER_AGENT = prev;
+    });
   });
 
   describe('loggedGet', () => {
