@@ -1,6 +1,7 @@
 // src/services/circuit-breaker.ts
 // Circuit breaker pattern implementation for upstream API protection.
 import { createLogger } from '../logger.js';
+import { CnbsServiceError, CnbsErrorType } from './error.js';
 
 const log = createLogger('circuit-breaker');
 
@@ -110,7 +111,20 @@ export class CircuitBreaker {
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
     if (!this.canExecute()) {
-      throw new Error(`Circuit breaker "${this.name}" is OPEN - request rejected`);
+      // 结构化拒绝错误：携带 retryAfter 与专属 code，供重试循环识别并直接抛出，
+      // 同时给 agent 可行动的提示（稍后重试 / 换数据源）。
+      const retryAfter = Math.max(0, this.resetTimeout - (Date.now() - this.stats.lastFailureTime));
+      throw new CnbsServiceError({
+        type: CnbsErrorType.RATE_LIMIT,
+        message: `Circuit breaker "${this.name}" is OPEN - request rejected`,
+        canRetry: true,
+        code: 'CIRCUIT_OPEN',
+        retryAfter,
+        hints: [
+          `上游 ${this.name} 连续失败已触发熔断，约 ${Math.ceil(retryAfter / 1000)} 秒后自动半开探测。`,
+          '建议稍后重试，或改用其他数据源工具获取同类数据。',
+        ],
+      });
     }
 
     if (this.state === CircuitState.HALF_OPEN) {

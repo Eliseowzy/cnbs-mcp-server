@@ -7,6 +7,8 @@ jest.mock('axios', () => ({
 import axios from 'axios';
 import { WorldBankDataSource } from '../services/data-sources/world-bank';
 import { IMFDataSource } from '../services/data-sources/imf';
+import { DepartmentDataSource } from '../services/data-sources/department';
+import { CnbsServiceError, CnbsErrorType } from '../services/error';
 
 const mockGet = axios.get as jest.MockedFunction<typeof axios.get>;
 
@@ -42,6 +44,81 @@ describe('WorldBankDataSource.fetchData', () => {
     await expect(
       wb.fetchData({ indicator: 'CPI', countries: ['USA'], startYear: 2000, endYear: 2001 }),
     ).rejects.toThrow('World Bank API returned empty data');
+  });
+});
+
+describe('WorldBankDataSource.fetchMulti', () => {
+  it('starts all indicator fetches in parallel and maps failures to {error}', async () => {
+    const wb = new WorldBankDataSource();
+    const deferred: Array<{ resolve: (v: unknown) => void; reject: (e: Error) => void }> = [];
+    jest.spyOn(wb, 'fetchData').mockImplementation(
+      () => new Promise((resolve, reject) => { deferred.push({ resolve, reject }); }) as never,
+    );
+
+    const promise = wb.fetchMulti({ indicators: ['GDP', 'CPI', 'POPULATION'] });
+    await Promise.resolve();
+
+    // 串行实现下第二个 fetchData 要等第一个 resolve 才会发起；并行实现下三个已全部发起。
+    expect(deferred).toHaveLength(3);
+
+    deferred[0].resolve({ source: 'world_bank', indicator: 'GDP' });
+    deferred[1].reject(new Error('upstream down'));
+    deferred[2].resolve({ source: 'world_bank', indicator: 'POPULATION' });
+
+    const results = await promise;
+    expect(results.GDP).toMatchObject({ indicator: 'GDP' });
+    expect(results.CPI).toEqual({ error: 'upstream down' });
+    expect(results.POPULATION).toMatchObject({ indicator: 'POPULATION' });
+  });
+});
+
+describe('DepartmentDataSource retry behaviour', () => {
+  let setTimeoutSpy: jest.SpyInstance;
+
+  beforeEach(() => {
+    mockGet.mockReset();
+    // 重试退避与节流间隔立即回调，避免测试真实等待。
+    setTimeoutSpy = jest.spyOn(global, 'setTimeout').mockImplementation(((cb: () => void) => {
+      cb();
+      return 0 as unknown as NodeJS.Timeout;
+    }) as unknown as typeof setTimeout);
+  });
+
+  afterEach(() => {
+    setTimeoutSpy.mockRestore();
+  });
+
+  it('search retries only inside findItems (3 attempts, not 9)', async () => {
+    mockGet.mockImplementation(async () => {
+      throw new CnbsServiceError({
+        type: CnbsErrorType.NETWORK_ISSUE,
+        message: 'network down',
+        canRetry: true,
+      });
+    });
+
+    const dept = new DepartmentDataSource();
+    await expect(dept.search('不会命中缓存的关键词')).rejects.toThrow('network down');
+    // findItems 内部重试 3 次；department 层不再叠加外层重试放大到 9 次。
+    expect(mockGet).toHaveBeenCalledTimes(3);
+  });
+
+  it('fetchAllKeywordsForDepartment queries all keywords in parallel', async () => {
+    const dept = new DepartmentDataSource();
+    const deferred: Array<(v: unknown) => void> = [];
+    jest
+      .spyOn((dept as unknown as { nbsClient: { findItems: (...args: unknown[]) => Promise<unknown> } }).nbsClient, 'findItems')
+      .mockImplementation(() => new Promise((resolve) => { deferred.push(resolve); }));
+
+    const promise = dept.fetchAllKeywordsForDepartment('finance');
+    await Promise.resolve();
+
+    // finance 预设 5 个关键词，并行实现下应全部同时发起。
+    expect(deferred).toHaveLength(5);
+
+    deferred.forEach((resolve, i) => resolve({ data: [{ id: i }] }));
+    const result = await promise;
+    expect(Object.keys(result.results)).toHaveLength(5);
   });
 });
 

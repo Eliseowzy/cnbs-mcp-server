@@ -1,4 +1,5 @@
 import { CircuitBreaker, CircuitState, getCircuitBreaker, getAllCircuitStats } from '../services/circuit-breaker';
+import { CnbsServiceError, CnbsErrorType } from '../services/error';
 
 describe('CircuitBreaker', () => {
   let breaker: CircuitBreaker;
@@ -99,6 +100,28 @@ describe('CircuitBreaker', () => {
       await expect(
         breaker.execute(async () => 'should not run'),
       ).rejects.toThrow('Circuit breaker "test" is OPEN');
+    });
+
+    it('should reject with a structured CnbsServiceError carrying CIRCUIT_OPEN and retryAfter', async () => {
+      breaker.recordFailure();
+      breaker.recordFailure();
+      breaker.recordFailure();
+
+      let caught: unknown;
+      try {
+        await breaker.execute(async () => 'should not run');
+      } catch (e) {
+        caught = e;
+      }
+
+      expect(caught).toBeInstanceOf(CnbsServiceError);
+      const details = (caught as CnbsServiceError).details;
+      expect(details.type).toBe(CnbsErrorType.RATE_LIMIT);
+      expect(details.code).toBe('CIRCUIT_OPEN');
+      expect(details.canRetry).toBe(true);
+      expect(details.retryAfter).toBeGreaterThanOrEqual(0);
+      expect(details.retryAfter).toBeLessThanOrEqual(100); // resetTimeout = 100
+      expect((details.hints || []).join(' ')).toContain('熔断');
     });
 
     it('should record failure when function throws', async () => {

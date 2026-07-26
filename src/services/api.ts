@@ -105,7 +105,18 @@ const PERIOD_QUARTER_RE = /^(\d{4})([A-D])$/;
 const PERIOD_MONTH_RE = /^(\d{4})(\d{2})MM$/;
 const QUARTER_START_MONTH: Record<string, number> = { A: 1, B: 4, C: 7, D: 10 };
 const PERIOD_FORMAT_HINT =
-  '支持年度 2024YY、季度 2024A/B/C/D、月度 202401MM，或区间 起-止（如 202001MM-202412MM）。';
+  '支持年度 2024YY、季度 2024A/B/C/D、月度 202401MM，或区间 起-止（如 202001MM-202412MM）。注意月度需带具体月份，如 2025MM 应写作 202501MM。';
+
+/**
+ * Auto-correct the common `YYYYMM`-without-month mistake (e.g. `2025MM`):
+ * range starts get month 01, range ends get month 12. Returns the token
+ * unchanged when it does not match the pattern.
+ */
+function fixYearOnlyMonthToken(token: string, boundary: 'start' | 'end'): string {
+  const m = /^(\d{4})MM$/.exec(token);
+  if (!m) return token;
+  return boundary === 'start' ? `${m[1]}01MM` : `${m[1]}12MM`;
+}
 
 /** Parse a single (non-range) period token, or null when the format is illegal. */
 function parseSinglePeriod(token: string): ParsedPeriod | null {
@@ -177,15 +188,27 @@ export function normalizePeriods(periods: string[], now: Date = new Date()): str
       throwPeriodValidationError(`非法的时间段格式：「${String(raw)}」。${PERIOD_FORMAT_HINT}`);
     }
 
-    // Range form X-Y (e.g. findAndFetch's 202001MM-202607MM): validate both
-    // endpoints then pass the original token through without future filtering.
+    // Range form X-Y (e.g. findAndFetch's 202001MM-202607MM): auto-correct
+    // `YYYYMM`-style endpoints (2025MM → 202501MM/202512MM), validate both
+    // endpoints then pass the corrected token through without future filtering.
     if (token.includes('-')) {
       const parts = token.split('-');
-      const valid = parts.length === 2 && parts.every((part) => parseSinglePeriod(part) !== null);
+      if (parts.length !== 2) {
+        throwPeriodValidationError(`非法的时间段区间：「${token}」。${PERIOD_FORMAT_HINT}`);
+      }
+      const start = fixYearOnlyMonthToken(parts[0], 'start');
+      const end = fixYearOnlyMonthToken(parts[1], 'end');
+      const valid = parseSinglePeriod(start) !== null && parseSinglePeriod(end) !== null;
       if (!valid) {
         throwPeriodValidationError(`非法的时间段区间：「${token}」。${PERIOD_FORMAT_HINT}`);
       }
-      kept.push(token);
+      kept.push(`${start}-${end}`);
+      continue;
+    }
+
+    // Single `YYYYMM` token (e.g. 2025MM): expand to the full-year month range.
+    if (/^\d{4}MM$/.test(token)) {
+      kept.push(`${fixYearOnlyMonthToken(token, 'start')}-${fixYearOnlyMonthToken(token, 'end')}`);
       continue;
     }
 
@@ -581,6 +604,16 @@ export class CnbsModernClient {
           );
           validateCnbsApiResponse(`${this.baseUrl}/stream/esData`, response);
           return response.data as CnbsSeriesResponse;
+        }, {
+          // esData 的 500 是确定性错误（无效指标+时段组合），重试只会灌满熔断器，
+          // 因此从可重试类型中去掉 API_FAILURE，其余端点保持默认行为。
+          retryableErrorTypes: [
+            CnbsErrorType.NETWORK_ISSUE,
+            CnbsErrorType.TIMEOUT_ISSUE,
+            CnbsErrorType.RATE_LIMIT,
+            CnbsErrorType.CACHE_ERROR,
+            CnbsErrorType.ACCESS_BLOCKED,
+          ],
         }),
       ),
       CNBS_DATA_CACHE_TTL,

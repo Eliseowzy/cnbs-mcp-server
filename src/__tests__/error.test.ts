@@ -1,4 +1,5 @@
-import { CnbsErrorHandler, CnbsErrorType, CnbsServiceError } from '../services/error.js';
+import { CnbsErrorHandler, CnbsErrorType, CnbsServiceError, errorMonitor } from '../services/error.js';
+import { upstreamRetriesTotal } from '../services/metrics.js';
 
 describe('CnbsErrorHandler.analyze', () => {
   it('enriches upstream 5xx with endpoint, hints and a compact body snippet', () => {
@@ -24,6 +25,21 @@ describe('CnbsErrorHandler.analyze', () => {
     expect(details.rawSnippet).toBe('{"error":"internal"}');
     expect(details.hints && details.hints.length).toBeGreaterThan(0);
     expect((details.hints || []).join(' ')).toContain('periods');
+  });
+
+  it('tracks the same error object only once across repeated analyze calls', () => {
+    errorMonitor.resetStats();
+    const error = new CnbsServiceError({
+      type: CnbsErrorType.NETWORK_ISSUE,
+      message: 'network down',
+      canRetry: true,
+    });
+
+    const first = CnbsErrorHandler.analyze(error);
+    const second = CnbsErrorHandler.analyze(error);
+
+    expect(second).toEqual(first);
+    expect(errorMonitor.getErrorStats()[CnbsErrorType.NETWORK_ISSUE]).toBe(1);
   });
 });
 
@@ -77,5 +93,37 @@ describe('CnbsErrorHandler.retryWithBackoff', () => {
     await expect(CnbsErrorHandler.retryWithBackoff(op)).rejects.toThrow('unexpected HTML payload');
     expect(op).toHaveBeenCalledTimes(1);
     expect(delays.length).toBe(0);
+  });
+
+  it('does not retry CIRCUIT_OPEN errors even though they are RATE_LIMIT/canRetry', async () => {
+    const op = jest.fn(async () => {
+      throw new CnbsServiceError({
+        type: CnbsErrorType.RATE_LIMIT,
+        message: 'Circuit breaker "series" is OPEN - request rejected',
+        canRetry: true,
+        code: 'CIRCUIT_OPEN',
+        retryAfter: 5000,
+      });
+    });
+
+    await expect(CnbsErrorHandler.retryWithBackoff(op)).rejects.toThrow('is OPEN');
+    expect(op).toHaveBeenCalledTimes(1);
+    expect(delays.length).toBe(0);
+  });
+
+  it('reports retry metrics with the real endpoint label when available', async () => {
+    const incSpy = jest.spyOn(upstreamRetriesTotal, 'inc');
+    const op = jest.fn(async () => {
+      throw new CnbsServiceError({
+        type: CnbsErrorType.API_FAILURE,
+        message: 'API error: 500',
+        canRetry: false,
+        endpoint: 'https://data.stats.gov.cn/dg/website/stream/esData',
+      });
+    });
+
+    await expect(CnbsErrorHandler.retryWithBackoff(op)).rejects.toThrow('API error: 500');
+    expect(incSpy).toHaveBeenCalledWith({ endpoint: 'https://data.stats.gov.cn/dg/website/stream/esData' });
+    incSpy.mockRestore();
   });
 });

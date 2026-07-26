@@ -1,5 +1,6 @@
 // 模拟 axios 模块
 import { CnbsModernClient, normalizePeriods } from '../services/api.js';
+import { CnbsServiceError, CnbsErrorType } from '../services/error.js';
 
 jest.mock('axios', () => ({
   get: jest.fn(),
@@ -195,6 +196,23 @@ describe('CnbsModernClient', () => {
       })).rejects.toThrow(/非法的时间段/);
       expect(mockAxiosPost).not.toHaveBeenCalled();
     });
+
+    it('does not retry deterministic 500 (API_FAILURE) on the series endpoint', async () => {
+      mockAxiosPost.mockRejectedValue(new CnbsServiceError({
+        type: CnbsErrorType.API_FAILURE,
+        message: 'API error: 500 Internal Server Error',
+        canRetry: true,
+        status: 500,
+      }));
+
+      await expect(client.fetchSeries({
+        setId: '1',
+        metricIds: ['1'],
+        periods: ['2024YY'],
+        areas: [{ text: '全国', code: '000000000000' }],
+      })).rejects.toThrow('API error: 500');
+      expect(mockAxiosPost).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe('normalizePeriods', () => {
@@ -225,6 +243,20 @@ describe('CnbsModernClient', () => {
 
     it('passes range tokens through untouched', () => {
       expect(normalizePeriods(['202001MM-202607MM'], now)).toEqual(['202001MM-202607MM']);
+    });
+
+    it('auto-corrects YYYYMM-style range endpoints to concrete months', () => {
+      expect(normalizePeriods(['2025MM-202607MM'], now)).toEqual(['202501MM-202607MM']);
+      expect(normalizePeriods(['202001MM-2025MM'], now)).toEqual(['202001MM-202512MM']);
+      expect(normalizePeriods(['2024MM-2025MM'], now)).toEqual(['202401MM-202512MM']);
+    });
+
+    it('expands a single YYYYMM token into a full-year month range', () => {
+      expect(normalizePeriods(['2025MM'], now)).toEqual(['202501MM-202512MM']);
+    });
+
+    it('mentions the 2025MM correction example in format errors', () => {
+      expect(() => normalizePeriods(['2024ZZ'], now)).toThrow(/2025MM 应写作 202501MM/);
     });
 
     it('throws on illegal single formats', () => {

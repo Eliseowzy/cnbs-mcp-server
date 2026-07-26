@@ -115,6 +115,18 @@ class DefaultErrorMonitor implements ErrorMonitor {
 // 全局错误监控实例
 export const errorMonitor = new DefaultErrorMonitor();
 
+// 已上报过的错误对象：同一错误在重试循环与工具层被多次 analyze 时，
+// 只 trackError（error 日志 + 指标）一次，避免日志重复行和指标虚高。
+const trackedErrors = new WeakSet<object>();
+
+function trackErrorOnce(error: unknown, details: CnbsErrorDetails): void {
+  if (error !== null && typeof error === 'object') {
+    if (trackedErrors.has(error)) return;
+    trackedErrors.add(error);
+  }
+  errorMonitor.trackError(details);
+}
+
 // 错误处理类
 export class CnbsErrorHandler {
   // 分析错误
@@ -125,12 +137,12 @@ export class CnbsErrorHandler {
         message: 'Unknown error occurred',
         canRetry: false,
       };
-      errorMonitor.trackError(details);
+      trackErrorOnce(error, details);
       return details;
     }
 
     if (error instanceof CnbsServiceError) {
-      errorMonitor.trackError(error.details);
+      trackErrorOnce(error, error.details);
       return error.details;
     }
 
@@ -143,7 +155,7 @@ export class CnbsErrorHandler {
           canRetry: true,
           code: error.code,
         };
-        errorMonitor.trackError(details);
+        trackErrorOnce(error, details);
         return details;
       }
 
@@ -159,7 +171,7 @@ export class CnbsErrorHandler {
             'Verify whether this network path requires a browser session, proxy, or additional cookies.'
           ],
         };
-        errorMonitor.trackError(details);
+        trackErrorOnce(error, details);
         return details;
       }
 
@@ -177,7 +189,7 @@ export class CnbsErrorHandler {
             status,
             retryAfter: retryAfter ? parseInt(retryAfter, 10) * 1000 : undefined,
           };
-          errorMonitor.trackError(details);
+          trackErrorOnce(error, details);
           return details;
         }
         if (status >= 500) {
@@ -195,7 +207,7 @@ export class CnbsErrorHandler {
               '上游对无效的指标+时段组合可能返回 500，请核对 metricIds 与 setId 是否对应。',
             ],
           };
-          errorMonitor.trackError(details);
+          trackErrorOnce(error, details);
           return details;
         }
         if (status >= 400) {
@@ -207,7 +219,7 @@ export class CnbsErrorHandler {
             code: error.code,
             status,
           };
-          errorMonitor.trackError(details);
+          trackErrorOnce(error, details);
           return details;
         }
       }
@@ -220,7 +232,7 @@ export class CnbsErrorHandler {
           canRetry: true,
           code: error.code,
         };
-        errorMonitor.trackError(details);
+        trackErrorOnce(error, details);
         return details;
       }
 
@@ -231,7 +243,7 @@ export class CnbsErrorHandler {
         canRetry: false,
         code: error.code,
       };
-      errorMonitor.trackError(details);
+      trackErrorOnce(error, details);
       return details;
     }
 
@@ -244,7 +256,7 @@ export class CnbsErrorHandler {
           source: error,
           canRetry: false,
         };
-        errorMonitor.trackError(details);
+        trackErrorOnce(error, details);
         return details;
       }
 
@@ -256,7 +268,7 @@ export class CnbsErrorHandler {
           source: error,
           canRetry: true,
         };
-        errorMonitor.trackError(details);
+        trackErrorOnce(error, details);
         return details;
       }
 
@@ -266,7 +278,7 @@ export class CnbsErrorHandler {
         source: error,
         canRetry: false,
       };
-      errorMonitor.trackError(details);
+      trackErrorOnce(error, details);
       return details;
     }
 
@@ -276,7 +288,7 @@ export class CnbsErrorHandler {
       source: error,
       canRetry: false,
     };
-    errorMonitor.trackError(details);
+    trackErrorOnce(error, details);
     return details;
   }
 
@@ -318,7 +330,12 @@ export class CnbsErrorHandler {
         lastError = error;
 
         log.warn({ attempt: attempt + 1, maxAttempts, err: compactAxiosError(error) ?? error }, 'Request attempt failed');
-        upstreamRetriesTotal.inc({ endpoint: 'unknown' });
+        upstreamRetriesTotal.inc({ endpoint: errorDetails.endpoint ?? 'unknown' });
+
+        // 熔断器 OPEN（CIRCUIT_OPEN）时原地重试只会继续撞 OPEN 状态，直接抛出。
+        if (errorDetails.code === 'CIRCUIT_OPEN') {
+          throw error;
+        }
 
         // 检查是否可以重试
         const canRetry = errorDetails.canRetry && retryableErrorTypes.includes(errorDetails.type);

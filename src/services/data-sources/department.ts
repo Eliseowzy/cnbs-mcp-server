@@ -1,7 +1,6 @@
 // src/services/data-sources/department.ts
 import { DataSource } from '../api.js';
 import { cacheHub, CacheKeyGenerator } from '../cache.js';
-import { CnbsErrorHandler } from '../error.js';
 import { cnbsRequestThrottler } from '../throttler.js';
 import { CnbsModernClient } from '../api.js';
 import type { CategoryItem, SearchResult } from '../../types/index.js';
@@ -95,22 +94,21 @@ export class DepartmentDataSource implements DataSource<DepartmentFetchParams, D
     });
     return this.cache.fetchOrLoad(
       cacheKey,
+      // findItems 内部已带重试，此处不再包 retryWithBackoff，避免嵌套重试放大至 9 次。
       () => cnbsRequestThrottler.execute(async () => {
-        return CnbsErrorHandler.retryWithBackoff(async () => {
-          const result = await this.nbsClient.findItems({
-            keyword,
-            pageSize: params.pageSize || 20,
-          });
-
-          return {
-            source: 'department_nbs',
-            department: params.department,
-            name: preset.name,
-            ministry: preset.ministry,
-            keyword,
-            data: result,
-          };
+        const result = await this.nbsClient.findItems({
+          keyword,
+          pageSize: params.pageSize || 20,
         });
+
+        return {
+          source: 'department_nbs',
+          department: params.department,
+          name: preset.name,
+          ministry: preset.ministry,
+          keyword,
+          data: result,
+        };
       }),
       4 * 60 * 60 * 1000,
       30 * 60 * 1000,
@@ -127,11 +125,10 @@ export class DepartmentDataSource implements DataSource<DepartmentFetchParams, D
   }
 
   async search(keyword: string): Promise<SearchResult> {
+    // findItems 内部已带重试，不再叠加外层重试。
     return cnbsRequestThrottler.execute(async () => {
-      return CnbsErrorHandler.retryWithBackoff(async () => {
-        const result = await this.nbsClient.findItems({ keyword, pageSize: 20 });
-        return { keyword, source: 'department_nbs', results: result };
-      });
+      const result = await this.nbsClient.findItems({ keyword, pageSize: 20 });
+      return { keyword, source: 'department_nbs', results: result };
     });
   }
 
@@ -139,15 +136,17 @@ export class DepartmentDataSource implements DataSource<DepartmentFetchParams, D
     const preset = DepartmentDataSource.DEPARTMENTS[department];
     if (!preset) throw new Error(`未知部门 "${department}"`);
 
-    const results: Record<string, any> = {};
-    for (const kw of preset.keywords) {
-      try {
-        const result = await this.nbsClient.findItems({ keyword: kw, pageSize: 5 });
-        results[kw] = result;
-      } catch (e) {
-        results[kw] = { error: (e as Error).message };
-      }
-    }
+    // 并行拉取各关键词；findItems 内部已带缓存/节流/重试，失败项转 {error}。
+    const entries = await Promise.all(
+      preset.keywords.map(async (kw) => {
+        try {
+          return [kw, await this.nbsClient.findItems({ keyword: kw, pageSize: 5 })] as const;
+        } catch (e) {
+          return [kw, { error: (e as Error).message }] as const;
+        }
+      }),
+    );
+    const results: Record<string, any> = Object.fromEntries(entries);
     return { department, name: preset.name, ministry: preset.ministry, results };
   }
 }

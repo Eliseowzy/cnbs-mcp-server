@@ -137,14 +137,16 @@ export class WorldBankDataSource implements DataSource<WorldBankFetchParams, Wor
     startYear?: number;
     endYear?: number;
   }): Promise<Record<string, WorldBankFetchResult | { error: string }>> {
-    const results: Record<string, WorldBankFetchResult | { error: string }> = {};
-    for (const ind of params.indicators) {
-      try {
-        results[ind] = await this.fetchData({ ...params, indicator: ind });
-      } catch (e) {
-        results[ind] = { error: (e as Error).message };
-      }
-    }
-    return results;
+    // 并行拉取各指标；缓存/节流在 fetchData 内部各自生效，失败项转 {error} 不影响其余。
+    const entries = await Promise.all(
+      params.indicators.map(async (ind) => {
+        try {
+          return [ind, await this.fetchData({ ...params, indicator: ind })] as const;
+        } catch (e) {
+          return [ind, { error: (e as Error).message }] as const;
+        }
+      }),
+    );
+    return Object.fromEntries(entries);
   }
 }
