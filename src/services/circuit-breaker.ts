@@ -15,6 +15,8 @@ export interface CircuitBreakerOptions {
   failureThreshold?: number;
   resetTimeout?: number;
   halfOpenMax?: number;
+  /** Upper bound for the exponential cool-down, defaults to 5 minutes. */
+  maxResetTimeout?: number;
 }
 
 interface CircuitStats {
@@ -22,6 +24,8 @@ interface CircuitStats {
   successes: number;
   lastFailureTime: number;
   halfOpenAttempts: number;
+  /** OPEN transitions since the last full recovery; drives cool-down backoff. */
+  consecutiveTrips: number;
 }
 
 export class CircuitBreaker {
@@ -31,11 +35,13 @@ export class CircuitBreaker {
     successes: 0,
     lastFailureTime: 0,
     halfOpenAttempts: 0,
+    consecutiveTrips: 0,
   };
 
   private readonly failureThreshold: number;
   private readonly resetTimeout: number;
   private readonly halfOpenMax: number;
+  private readonly maxResetTimeout: number;
   private readonly name: string;
 
   constructor(name: string, options: CircuitBreakerOptions = {}) {
@@ -43,13 +49,25 @@ export class CircuitBreaker {
     this.failureThreshold = options.failureThreshold ?? 5;
     this.resetTimeout = options.resetTimeout ?? 30_000;
     this.halfOpenMax = options.halfOpenMax ?? 2;
+    this.maxResetTimeout = options.maxResetTimeout ?? 5 * 60_000;
+  }
+
+  /**
+   * Effective cool-down before OPEN → HALF_OPEN: base resetTimeout doubled per
+   * consecutive trip and capped at maxResetTimeout, so a persistent upstream
+   * block (e.g. a WAF storm) is probed ever less frequently instead of every
+   * base interval.
+   */
+  private currentResetTimeout(): number {
+    const exponent = Math.max(0, this.stats.consecutiveTrips - 1);
+    return Math.min(this.resetTimeout * 2 ** exponent, this.maxResetTimeout);
   }
 
   getState(): CircuitState {
     // Check if we should transition from OPEN to HALF_OPEN
     if (this.state === CircuitState.OPEN) {
       const elapsed = Date.now() - this.stats.lastFailureTime;
-      if (elapsed >= this.resetTimeout) {
+      if (elapsed >= this.currentResetTimeout()) {
         this.state = CircuitState.HALF_OPEN;
         this.stats.halfOpenAttempts = 0;
         log.info({ circuit: this.name }, 'Circuit transitioned to HALF_OPEN');
@@ -95,8 +113,25 @@ export class CircuitBreaker {
 
   private trip(): void {
     this.state = CircuitState.OPEN;
+    this.stats.consecutiveTrips++;
+    this.stats.lastFailureTime = Date.now();
     this.stats.halfOpenAttempts = 0;
     this.stats.successes = 0;
+  }
+
+  /**
+   * Trip triggered from outside the breaker (linked/site-wide block, e.g. a
+   * WAF challenge detected on a sibling endpoint). Counts as one trip for the
+   * cool-down backoff; when already OPEN it only refreshes the block timestamp
+   * so the same detection is not double-counted.
+   */
+  forceTrip(): void {
+    if (this.state === CircuitState.OPEN) {
+      this.stats.lastFailureTime = Date.now();
+      return;
+    }
+    log.warn({ circuit: this.name }, 'Circuit force-tripped to OPEN (linked block)');
+    this.trip();
   }
 
   private reset(): void {
@@ -106,14 +141,16 @@ export class CircuitBreaker {
       successes: 0,
       lastFailureTime: 0,
       halfOpenAttempts: 0,
+      consecutiveTrips: 0,
     };
   }
 
   async execute<T>(fn: () => Promise<T>): Promise<T> {
     if (!this.canExecute()) {
       // 结构化拒绝错误：携带 retryAfter 与专属 code，供重试循环识别并直接抛出，
-      // 同时给 agent 可行动的提示（稍后重试 / 换数据源）。
-      const retryAfter = Math.max(0, this.resetTimeout - (Date.now() - this.stats.lastFailureTime));
+      // 同时给 agent 可行动的提示（稍后重试 / 换数据源）。冷却时长随连续熔断
+      // 次数指数递增，retryAfter 始终反映当前动态冷却值。
+      const retryAfter = Math.max(0, this.currentResetTimeout() - (Date.now() - this.stats.lastFailureTime));
       throw new CnbsServiceError({
         type: CnbsErrorType.RATE_LIMIT,
         message: `Circuit breaker "${this.name}" is OPEN - request rejected`,
@@ -121,7 +158,7 @@ export class CircuitBreaker {
         code: 'CIRCUIT_OPEN',
         retryAfter,
         hints: [
-          `上游 ${this.name} 连续失败已触发熔断，约 ${Math.ceil(retryAfter / 1000)} 秒后自动半开探测。`,
+          `上游 ${this.name} 连续失败已触发熔断（连续第 ${this.stats.consecutiveTrips} 次），约 ${Math.ceil(retryAfter / 1000)} 秒后自动半开探测；冷却时长随连续熔断次数指数递增。`,
           '建议稍后重试，或改用其他数据源工具获取同类数据。',
         ],
       });
@@ -141,11 +178,12 @@ export class CircuitBreaker {
     }
   }
 
-  getStats(): { state: CircuitState; failures: number; successes: number } {
+  getStats(): { state: CircuitState; failures: number; successes: number; consecutiveTrips: number } {
     return {
       state: this.getState(),
       failures: this.stats.failures,
       successes: this.stats.successes,
+      consecutiveTrips: this.stats.consecutiveTrips,
     };
   }
 }
@@ -161,10 +199,21 @@ export function getCircuitBreaker(name: string, options?: CircuitBreakerOptions)
   return breakers.get(name)!;
 }
 
-export function getAllCircuitStats(): Record<string, { state: CircuitState; failures: number; successes: number }> {
-  const stats: Record<string, { state: CircuitState; failures: number; successes: number }> = {};
+export function getAllCircuitStats(): Record<string, { state: CircuitState; failures: number; successes: number; consecutiveTrips: number }> {
+  const stats: Record<string, { state: CircuitState; failures: number; successes: number; consecutiveTrips: number }> = {};
   for (const [name, breaker] of breakers) {
     stats[name] = breaker.getStats();
   }
   return stats;
+}
+
+/**
+ * Trip the named breakers directly (creating them on demand), used for linked
+ * tripping when one endpoint detects a site-wide block that necessarily
+ * affects its siblings behind the same WAF.
+ */
+export function tripBreakers(names: string[]): void {
+  for (const name of names) {
+    getCircuitBreaker(name).forceTrip();
+  }
 }

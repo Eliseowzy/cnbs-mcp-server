@@ -105,7 +105,7 @@ const PERIOD_QUARTER_RE = /^(\d{4})([A-D])$/;
 const PERIOD_MONTH_RE = /^(\d{4})(\d{2})MM$/;
 const QUARTER_START_MONTH: Record<string, number> = { A: 1, B: 4, C: 7, D: 10 };
 const PERIOD_FORMAT_HINT =
-  '支持年度 2024YY、季度 2024A/B/C/D、月度 202401MM，或区间 起-止（如 202001MM-202412MM）。注意月度需带具体月份，如 2025MM 应写作 202501MM。';
+  '支持年度 2024YY、季度 2024A/B/C/D（A=1季度，D=4季度，如 2023A～2023D）、月度 202401MM，或区间 起-止（如 202001MM-202412MM）。注意月度需带具体月份，如 2025MM 应写作 202501MM。';
 
 /**
  * Auto-correct the common `YYYYMM`-without-month mistake (e.g. `2025MM`):
@@ -116,6 +116,27 @@ function fixYearOnlyMonthToken(token: string, boundary: 'start' | 'end'): string
   const m = /^(\d{4})MM$/.exec(token);
   if (!m) return token;
   return boundary === 'start' ? `${m[1]}01MM` : `${m[1]}12MM`;
+}
+
+/**
+ * Auto-correct further common malformed tokens (also applied to range
+ * endpoints):
+ *  - `YYYYMMYY` (e.g. 202001YY): stray month digits on an annual token → keep
+ *    the year only (`2020YY`).
+ *  - `YYYYMMSS` (e.g. 202301SS): month written with a bogus `SS` suffix → map
+ *    the month to its quarter letter (`2023A`).
+ * Returns the token unchanged when no rule applies.
+ */
+function fixMalformedPeriodToken(token: string): string {
+  const annualWithMonth = /^(\d{4})\d{2}YY$/.exec(token);
+  if (annualWithMonth) return `${annualWithMonth[1]}YY`;
+
+  const monthAsQuarter = /^(\d{4})(0[1-9]|1[0-2])SS$/.exec(token);
+  if (monthAsQuarter) {
+    const quarter = 'ABCD'[Math.floor((Number(monthAsQuarter[2]) - 1) / 3)];
+    return `${monthAsQuarter[1]}${quarter}`;
+  }
+  return token;
 }
 
 /** Parse a single (non-range) period token, or null when the format is illegal. */
@@ -189,15 +210,16 @@ export function normalizePeriods(periods: string[], now: Date = new Date()): str
     }
 
     // Range form X-Y (e.g. findAndFetch's 202001MM-202607MM): auto-correct
-    // `YYYYMM`-style endpoints (2025MM → 202501MM/202512MM), validate both
-    // endpoints then pass the corrected token through without future filtering.
+    // `YYYYMM`-style endpoints (2025MM → 202501MM/202512MM) and malformed
+    // tokens (202001YY → 2020YY, 202301SS → 2023A), validate both endpoints
+    // then pass the corrected token through without future filtering.
     if (token.includes('-')) {
       const parts = token.split('-');
       if (parts.length !== 2) {
         throwPeriodValidationError(`非法的时间段区间：「${token}」。${PERIOD_FORMAT_HINT}`);
       }
-      const start = fixYearOnlyMonthToken(parts[0], 'start');
-      const end = fixYearOnlyMonthToken(parts[1], 'end');
+      const start = fixYearOnlyMonthToken(fixMalformedPeriodToken(parts[0]), 'start');
+      const end = fixYearOnlyMonthToken(fixMalformedPeriodToken(parts[1]), 'end');
       const valid = parseSinglePeriod(start) !== null && parseSinglePeriod(end) !== null;
       if (!valid) {
         throwPeriodValidationError(`非法的时间段区间：「${token}」。${PERIOD_FORMAT_HINT}`);
@@ -206,21 +228,24 @@ export function normalizePeriods(periods: string[], now: Date = new Date()): str
       continue;
     }
 
+    // Auto-correct malformed single tokens before further parsing.
+    const fixed = fixMalformedPeriodToken(token);
+
     // Single `YYYYMM` token (e.g. 2025MM): expand to the full-year month range.
-    if (/^\d{4}MM$/.test(token)) {
-      kept.push(`${fixYearOnlyMonthToken(token, 'start')}-${fixYearOnlyMonthToken(token, 'end')}`);
+    if (/^\d{4}MM$/.test(fixed)) {
+      kept.push(`${fixYearOnlyMonthToken(fixed, 'start')}-${fixYearOnlyMonthToken(fixed, 'end')}`);
       continue;
     }
 
-    const parsed = parseSinglePeriod(token);
+    const parsed = parseSinglePeriod(fixed);
     if (!parsed) {
       throwPeriodValidationError(`非法的时间段格式：「${token}」。${PERIOD_FORMAT_HINT}`);
     }
     if (isFuturePeriod(parsed, now)) {
-      filteredFuture.push(token);
+      filteredFuture.push(fixed);
       continue;
     }
-    kept.push(token);
+    kept.push(fixed);
   }
 
   if (kept.length === 0) {
@@ -475,8 +500,11 @@ export class CnbsModernClient {
           url.searchParams.set('pagenum', (params.pageNum || 1).toString());
           url.searchParams.set('pageSize', (params.pageSize || 10).toString());
           log.debug({ url: url.toString() }, 'Search Request');
-          const response = await loggedGet('search', url.toString(), { ...sharedAxiosConfig, timeout: this.timeout });
-          validateCnbsApiResponse(url.toString(), response);
+          const response = await loggedGet(
+            'search', url.toString(), { ...sharedAxiosConfig, timeout: this.timeout },
+            // 在熔断器内校验：WAF 挑战页（HTTP 200 + HTML）也计入熔断失败并触发联动熔断。
+            (res) => validateCnbsApiResponse(url.toString(), res),
+          );
           log.debug({ url: url.toString(), status: response.status }, 'Search Response');
           return normalizeSearchResponse(response.data);
         }),
@@ -510,8 +538,10 @@ export class CnbsModernClient {
           if (params.parentId) url.searchParams.set('pid', params.parentId);
           url.searchParams.set('code', params.category);
           log.debug({ url: url.toString() }, 'Node Request');
-          const response = await loggedGet('node', url.toString(), { ...sharedAxiosConfig, timeout: this.timeout });
-          validateCnbsApiResponse(url.toString(), response);
+          const response = await loggedGet(
+            'node', url.toString(), { ...sharedAxiosConfig, timeout: this.timeout },
+            (res) => validateCnbsApiResponse(url.toString(), res),
+          );
           return response.data as CnbsNodeResponse;
         }),
       ),
@@ -566,8 +596,10 @@ export class CnbsModernClient {
           if (params.dataType) url.searchParams.set('dt', params.dataType);
           if (params.name) url.searchParams.set('name', params.name);
           log.debug({ url: url.toString() }, 'Metric Request');
-          const response = await loggedGet('metric', url.toString(), { ...sharedAxiosConfig, timeout: this.timeout });
-          validateCnbsApiResponse(url.toString(), response);
+          const response = await loggedGet(
+            'metric', url.toString(), { ...sharedAxiosConfig, timeout: this.timeout },
+            (res) => validateCnbsApiResponse(url.toString(), res),
+          );
           return response.data as CnbsMetricResponse;
         }),
       ),
@@ -601,18 +633,18 @@ export class CnbsModernClient {
             'series',
             `${this.baseUrl}/stream/esData`, payload,
             { ...sharedAxiosConfig, timeout: this.timeout, headers: { ...sharedAxiosConfig.headers, 'Content-Type': 'application/json' } },
+            (res) => validateCnbsApiResponse(`${this.baseUrl}/stream/esData`, res),
           );
-          validateCnbsApiResponse(`${this.baseUrl}/stream/esData`, response);
           return response.data as CnbsSeriesResponse;
         }, {
           // esData 的 500 是确定性错误（无效指标+时段组合），重试只会灌满熔断器，
-          // 因此从可重试类型中去掉 API_FAILURE，其余端点保持默认行为。
+          // 因此从可重试类型中去掉 API_FAILURE；ACCESS_BLOCKED（WAF 封锁）已全局
+          // 不再原地重试，其余端点保持默认行为。
           retryableErrorTypes: [
             CnbsErrorType.NETWORK_ISSUE,
             CnbsErrorType.TIMEOUT_ISSUE,
             CnbsErrorType.RATE_LIMIT,
             CnbsErrorType.CACHE_ERROR,
-            CnbsErrorType.ACCESS_BLOCKED,
           ],
         }),
       ),

@@ -307,18 +307,16 @@ export class CnbsErrorHandler {
     const baseDelay = settings?.baseDelay || 1000;
     const maxDelay = settings?.maxDelay || 10000;
     const backoffFactor = settings?.backoffFactor || 2;
+    // ACCESS_BLOCKED is intentionally NOT retryable: WAF blocks last minutes to
+    // hours, so in-place retries within seconds never succeed and only burn
+    // 6~9s per call while hammering the WAF again. Fail fast instead.
     const retryableErrorTypes = settings?.retryableErrorTypes || [
       CnbsErrorType.NETWORK_ISSUE,
       CnbsErrorType.TIMEOUT_ISSUE,
       CnbsErrorType.RATE_LIMIT,
       CnbsErrorType.API_FAILURE,
       CnbsErrorType.CACHE_ERROR,
-      CnbsErrorType.ACCESS_BLOCKED,
     ];
-
-    // WAF challenges self-heal only after a pause; retrying too quickly just
-    // re-triggers the block, so ACCESS_BLOCKED gets a higher backoff floor.
-    const ACCESS_BLOCKED_MIN_DELAY = 3000;
 
     let lastError: unknown;
 
@@ -349,18 +347,8 @@ export class CnbsErrorHandler {
           maxDelay
         );
 
-        // WAF blocks need a longer cool-down before the challenge lifts.
-        if (errorDetails.type === CnbsErrorType.ACCESS_BLOCKED) {
-          delay = Math.max(delay, ACCESS_BLOCKED_MIN_DELAY);
-        }
-
         // 添加随机抖动，避免重试风暴
         delay = delay * (0.8 + Math.random() * 0.4);
-
-        // Keep the ACCESS_BLOCKED floor intact even after downward jitter.
-        if (errorDetails.type === CnbsErrorType.ACCESS_BLOCKED) {
-          delay = Math.max(delay, ACCESS_BLOCKED_MIN_DELAY);
-        }
 
         log.debug({ delayMs: Math.round(delay) }, 'Retrying request');
         await this.wait(Math.round(delay));

@@ -255,6 +255,22 @@ describe('CnbsModernClient', () => {
       expect(normalizePeriods(['2025MM'], now)).toEqual(['202501MM-202512MM']);
     });
 
+    it('auto-corrects YYYYMMYY annual tokens (single and range endpoints)', () => {
+      expect(normalizePeriods(['202001YY'], now)).toEqual(['2020YY']);
+      expect(normalizePeriods(['202001YY-202512YY'], now)).toEqual(['2020YY-2025YY']);
+    });
+
+    it('auto-corrects YYYYMMSS month-as-quarter tokens to quarter letters', () => {
+      expect(normalizePeriods(['202301SS'], now)).toEqual(['2023A']);
+      expect(normalizePeriods(['202304SS'], now)).toEqual(['2023B']);
+      expect(normalizePeriods(['202307SS'], now)).toEqual(['2023C']);
+      expect(normalizePeriods(['202312SS'], now)).toEqual(['2023D']);
+    });
+
+    it('mentions the quarter letter notation in the format hint', () => {
+      expect(() => normalizePeriods(['2024ZZ'], now)).toThrow(/A=1季度/);
+    });
+
     it('mentions the 2025MM correction example in format errors', () => {
       expect(() => normalizePeriods(['2024ZZ'], now)).toThrow(/2025MM 应写作 202501MM/);
     });

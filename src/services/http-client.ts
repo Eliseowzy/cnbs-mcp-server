@@ -8,7 +8,8 @@ import {
   upstreamRequestsTotal,
   upstreamRequestDurationMs,
 } from './metrics.js';
-import { getCircuitBreaker } from './circuit-breaker.js';
+import { getCircuitBreaker, tripBreakers } from './circuit-breaker.js';
+import { CnbsServiceError, CnbsErrorType } from './error.js';
 
 const log = createLogger('http-client');
 
@@ -38,50 +39,91 @@ export const sharedAxiosConfig: AxiosRequestConfig = {
 };
 
 /**
+ * The four CNBS endpoints sit behind the same upstream WAF: a block observed
+ * on any one of them applies site-wide, so their breakers are tripped
+ * together. External sources (world_bank/oecd/imf/...) are never linked.
+ */
+const CNBS_LINKED_SOURCES = ['search', 'series', 'node', 'metric'];
+
+/** WAF block signals: challenge page (ACCESS_BLOCKED) or redirect loop. */
+function isAccessBlockedError(error: unknown): boolean {
+  if (error instanceof CnbsServiceError) {
+    return error.details.type === CnbsErrorType.ACCESS_BLOCKED;
+  }
+  return (error as { code?: string } | null | undefined)?.code === 'ERR_FR_TOO_MANY_REDIRECTS';
+}
+
+/** On a WAF block detected for a CNBS source, trip all CNBS breakers at once. */
+function tripLinkedCnbsBreakers(source: string, error: unknown): void {
+  if (!CNBS_LINKED_SOURCES.includes(source)) return;
+  if (!isAccessBlockedError(error)) return;
+  log.warn({ source }, 'WAF block detected, tripping all CNBS circuit breakers');
+  tripBreakers(CNBS_LINKED_SOURCES);
+}
+
+/**
  * Perform a GET request with structured logging, upstream metrics, and circuit breaker.
+ * The optional `validate` hook runs inside the breaker so payload-level failures
+ * (e.g. a WAF challenge page returned with HTTP 200) count as breaker failures.
  */
 export async function loggedGet<T = any>(
   source: string,
   url: string,
   config?: AxiosRequestConfig,
+  validate?: (response: AxiosResponse<T>) => void,
 ): Promise<AxiosResponse<T>> {
   const breaker = getCircuitBreaker(source);
-  return breaker.execute(async () => {
-    const startedAt = Date.now();
-    log.debug({ source, url }, 'Upstream request');
-    const end = upstreamRequestDurationMs.startTimer({ endpoint: source });
-    try {
-      const response = await axios.get<T>(url, config);
-      upstreamRequestsTotal.inc({ endpoint: source });
-      log.debug({ source, url, status: response.status, durationMs: Date.now() - startedAt }, 'Upstream response');
-      return response;
-    } finally {
-      end();
-    }
-  });
+  try {
+    return await breaker.execute(async () => {
+      const startedAt = Date.now();
+      log.debug({ source, url }, 'Upstream request');
+      const end = upstreamRequestDurationMs.startTimer({ endpoint: source });
+      try {
+        const response = await axios.get<T>(url, config);
+        validate?.(response);
+        upstreamRequestsTotal.inc({ endpoint: source });
+        log.debug({ source, url, status: response.status, durationMs: Date.now() - startedAt }, 'Upstream response');
+        return response;
+      } finally {
+        end();
+      }
+    });
+  } catch (error) {
+    tripLinkedCnbsBreakers(source, error);
+    throw error;
+  }
 }
 
 /**
  * Perform a POST request with structured logging, upstream metrics, and circuit breaker.
+ * The optional `validate` hook runs inside the breaker so payload-level failures
+ * (e.g. a WAF challenge page returned with HTTP 200) count as breaker failures.
  */
 export async function loggedPost<T = any>(
   source: string,
   url: string,
   data?: unknown,
   config?: AxiosRequestConfig,
+  validate?: (response: AxiosResponse<T>) => void,
 ): Promise<AxiosResponse<T>> {
   const breaker = getCircuitBreaker(source);
-  return breaker.execute(async () => {
-    const startedAt = Date.now();
-    log.debug({ source, url }, 'Upstream POST request');
-    const end = upstreamRequestDurationMs.startTimer({ endpoint: source });
-    try {
-      const response = await axios.post<T>(url, data, config);
-      upstreamRequestsTotal.inc({ endpoint: source });
-      log.debug({ source, url, status: response.status, durationMs: Date.now() - startedAt }, 'Upstream POST response');
-      return response;
-    } finally {
-      end();
-    }
-  });
+  try {
+    return await breaker.execute(async () => {
+      const startedAt = Date.now();
+      log.debug({ source, url }, 'Upstream POST request');
+      const end = upstreamRequestDurationMs.startTimer({ endpoint: source });
+      try {
+        const response = await axios.post<T>(url, data, config);
+        validate?.(response);
+        upstreamRequestsTotal.inc({ endpoint: source });
+        log.debug({ source, url, status: response.status, durationMs: Date.now() - startedAt }, 'Upstream POST response');
+        return response;
+      } finally {
+        end();
+      }
+    });
+  } catch (error) {
+    tripLinkedCnbsBreakers(source, error);
+    throw error;
+  }
 }

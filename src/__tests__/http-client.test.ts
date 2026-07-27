@@ -101,4 +101,80 @@ describe('http-client', () => {
       expect(mockGet.mock.calls.length).toBe(callsBefore);
     });
   });
+
+  describe('linked CNBS breaker tripping on WAF blocks', () => {
+    // Each test runs in an isolated module registry so it starts from a
+    // clean circuit breaker registry (the registry is module-level state).
+    const CNBS_SOURCES = ['search', 'series', 'node', 'metric'];
+
+    it('trips all four CNBS breakers on a redirect loop, leaving world_bank untouched', async () => {
+      await jest.isolateModulesAsync(async () => {
+        const ax = (await import('axios')) as unknown as { get: jest.Mock };
+        const hc = await import('../services/http-client');
+        const cb = await import('../services/circuit-breaker');
+
+        cb.getCircuitBreaker('world_bank'); // pre-create to assert it stays CLOSED
+        ax.get.mockRejectedValue(
+          Object.assign(new Error('too many redirects'), { code: 'ERR_FR_TOO_MANY_REDIRECTS' }),
+        );
+
+        await expect(hc.loggedGet('search', 'https://example.com/x')).rejects.toThrow('too many redirects');
+
+        const stats = cb.getAllCircuitStats();
+        for (const name of CNBS_SOURCES) {
+          expect(stats[name].state).toBe(cb.CircuitState.OPEN);
+        }
+        expect(stats['world_bank'].state).toBe(cb.CircuitState.CLOSED);
+      });
+    });
+
+    it('trips all four CNBS breakers when the validate hook flags a WAF challenge page', async () => {
+      await jest.isolateModulesAsync(async () => {
+        const ax = (await import('axios')) as unknown as { post: jest.Mock };
+        const hc = await import('../services/http-client');
+        const cb = await import('../services/circuit-breaker');
+        const err = await import('../services/error');
+
+        ax.post.mockResolvedValue({
+          status: 200,
+          headers: { 'content-type': 'text/html' },
+          data: '<html>Please enable JavaScript and refresh the page</html>',
+        });
+
+        await expect(hc.loggedPost('series', 'https://example.com/esData', {}, undefined, () => {
+          throw new err.CnbsServiceError({
+            type: err.CnbsErrorType.ACCESS_BLOCKED,
+            message: 'CNBS upstream returned an anti-bot challenge page',
+            canRetry: true,
+          });
+        })).rejects.toThrow('challenge page');
+
+        const stats = cb.getAllCircuitStats();
+        for (const name of CNBS_SOURCES) {
+          expect(stats[name].state).toBe(cb.CircuitState.OPEN);
+        }
+      });
+    });
+
+    it('does not link-trip CNBS breakers for external sources', async () => {
+      await jest.isolateModulesAsync(async () => {
+        const ax = (await import('axios')) as unknown as { get: jest.Mock };
+        const hc = await import('../services/http-client');
+        const cb = await import('../services/circuit-breaker');
+
+        ax.get.mockRejectedValue(
+          Object.assign(new Error('too many redirects'), { code: 'ERR_FR_TOO_MANY_REDIRECTS' }),
+        );
+
+        await expect(hc.loggedGet('world_bank', 'https://example.com/wb')).rejects.toThrow('too many redirects');
+
+        const stats = cb.getAllCircuitStats();
+        // Single failure < threshold, and no CNBS breaker was created/tripped.
+        expect(stats['world_bank'].state).toBe(cb.CircuitState.CLOSED);
+        for (const name of CNBS_SOURCES) {
+          expect(stats[name]).toBeUndefined();
+        }
+      });
+    });
+  });
 });

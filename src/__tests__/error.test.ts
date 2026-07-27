@@ -60,25 +60,18 @@ describe('CnbsErrorHandler.retryWithBackoff', () => {
     setTimeoutSpy.mockRestore();
   });
 
-  it('retries ACCESS_BLOCKED with a backoff floor of at least 3s', async () => {
-    let calls = 0;
+  it('does not retry ACCESS_BLOCKED errors (WAF blocks outlast in-place retries)', async () => {
     const op = jest.fn(async () => {
-      calls += 1;
-      if (calls === 1) {
-        throw new CnbsServiceError({
-          type: CnbsErrorType.ACCESS_BLOCKED,
-          message: 'blocked by WAF',
-          canRetry: true,
-        });
-      }
-      return 'ok';
+      throw new CnbsServiceError({
+        type: CnbsErrorType.ACCESS_BLOCKED,
+        message: 'blocked by WAF',
+        canRetry: true,
+      });
     });
 
-    const result = await CnbsErrorHandler.retryWithBackoff(op);
-
-    expect(result).toBe('ok');
-    expect(op).toHaveBeenCalledTimes(2);
-    expect(delays[0]).toBeGreaterThanOrEqual(3000);
+    await expect(CnbsErrorHandler.retryWithBackoff(op)).rejects.toThrow('blocked by WAF');
+    expect(op).toHaveBeenCalledTimes(1);
+    expect(delays.length).toBe(0);
   });
 
   it('does not retry non-WAF HTML (API_FAILURE with canRetry:false)', async () => {
